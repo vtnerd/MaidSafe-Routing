@@ -134,6 +134,8 @@ class RoutingNode : public std::enable_shared_from_this<RoutingNode<Child>>,
   Sentinel sentinel_;
   LruCache<Address, SerialisedMessage> cache_;
   std::vector<Address> connected_nodes_;
+  std::unordered_map<std::pair<PeerId, MessageId>, std::function<void(SerialisedMessage)>> expected_responses_;
+  std::mutex mutex_;
 };
 
 template <typename Child>
@@ -202,13 +204,14 @@ SendReturn<CompletionToken> RoutingNode<Child>::Send(NodeId peer_id,
         ASIO_CORO_YIELD {
           auto& this_node = coro.frame().routing_node.get();
 
-          // call_once synchronizes with send and receive async operation
+          // call_once synchronizes with send and receive operation
           auto store_result = action::CallOnce(
               std::ref(coro.frame().once),
               action::Store(std::ref(coro.frame().result)).Then(action::Resume(coro)));
           {
+            auto key = std::make_pair(coro.frame().peer_id, std::move(coro.frame().message_id));
             const std::lock_guard<std::mutex> lock{this_node.mutex_};
-            this_node.expected_messages[std::move(coro.frame().message_id)] = store_result;
+            this_node.expected_responses_[std::move(key)] = store_result;
           }
 
           coro.frame().timer.expires_from_now(std::chrono::seconds(30));
@@ -216,27 +219,24 @@ SendReturn<CompletionToken> RoutingNode<Child>::Send(NodeId peer_id,
               if (error) {
                 store_result(boost::make_unexpected(error));
               } else {
-                store_result(boost::make_unexpected(std::errc::timeout));
+                store_result(boost::make_unexpected(make_error_code(RudpErrors::timed_out)));
               }
             });
 
+          // retry can be done somehow
           this_node.rudp_.Send(
-                std::move(coro.frame().peer_id),
-                std::move(coro.frame.message),
-                [store_result](int result) {
-                  if (result == error ) {
-                    handler(boost::make_unexpected(...));
-                  }
-                });
-        } // yield
+              std::move(coro.frame().peer_id),
+              std::move(coro.frame.message),
+              [store_result](const int error) {
+                if (error) {
+                  store_result(boost::make_unexpected(make_error_code(RudpErrors::no_connected)));
+                }
+              });
+        } // yield (send, receive, and timeout all re-start here. only first completed is executed)
 
-        if (coro.frame().result) {
-          // process ?
-          coro.frame().handler(DataType{});
-        } else {
-          // retry (burned once_flag ... crap, theres a better way obviously)
-          coro.frame().handler(boost::make_unexpected(...));
-        }
+        // without retry loop, you can actually do `CallOnce(std::ref(once), handler);`,
+        // which might be confusing
+        coro.frame().handler(std::move(coro.frame().result));
       }
     }
   };
@@ -268,7 +268,7 @@ GetReturn<CompletionToken> RoutingNode<Child>::Get(Identity key, Address to,
       Address to;
       MessageId message_id;
       SerialisedData message;
-      std::vector<boost::expected<DataType, std::error_code>> results;
+      std::vector<boost::expected<SerialisedData, std::error_code>> results;
       std::atomic<std::size_t> count;
       Handler handler;
     };
@@ -285,15 +285,22 @@ GetReturn<CompletionToken> RoutingNode<Child>::Get(Identity key, Address to,
           for (const auto& target : targets) {
             coro.frame().routing_node.get().Send<DataType>(
                 target.id,
-                std::move(coro.frame().message_id),
-                std::move(coro.frame().message),
+                coro.frame().message_id,
+                coro.frame().message,
                 action::Store(std::ref(coro.frame().results[count])).Then(action::Resume(coro)));
             ++count;
           }
         } // yield
 
         if (--(coro.frame().count) == 0) {
-          coro.frame().handler(coro.frame().sentinel(coro.frame().results));
+          for (const auto& result : results) {
+            if (result) {
+              auto data = Parse<GetData>(*result);
+              // give result to sentinel
+            } else {
+              // give error to sentinel
+            }
+          }
         }
       }
     }
@@ -383,7 +390,7 @@ void RoutingNode<Child>::ConnectToCloseGroup() {
     });
 }
 template <typename Child>
-void RoutingNode<Child>::MessageReceived(NodeId /* peer_id */,
+void RoutingNode<Child>::MessageReceived(NodeId peer_id,
                                          rudp::ReceivedMessage serialised_message) {
   InputVectorStream binary_input_stream{serialised_message};
   MessageHeader header;
@@ -445,6 +452,23 @@ void RoutingNode<Child>::MessageReceived(NodeId /* peer_id */,
   if (!connection_manager_.AddressInCloseGroupRange(header.GetDestination().first))
     return;  // not for us
 
+  {
+    std::unique_lock<std::mutex> lock{mutex_};
+    const auto expected =
+      expected_messages_.find(std::make_pair(std::move(peer_id), header.GetMessageId()));
+    if (expected != expected_messages_.end()) {
+      auto handler = std::move(expected->second);
+      expected_messages_.erase(expected);
+      lock.unlock();
+
+      assert(binary_input_stream.tellg() <= serialised_message.size());
+      serialised_message.erase(
+          serialised_message.begin(), serialised_message.begin() + binary_input_stream.tellg());
+      expected_handler(std::move(serialised_message));
+      return;
+    }
+  }
+
   // FIXME(dirvine) Sentinel check here!!  :19/01/2015
   switch (tag) {
     case MessageTypeTag::Connect:
@@ -466,7 +490,7 @@ void RoutingNode<Child>::MessageReceived(NodeId /* peer_id */,
                                            key);
       break;
     case MessageTypeTag::GetDataResponse:
-      HandleMessage(Parse<GetDataResponse>(binary_input_stream), std::move(header));
+      LOG(kWarning) << "Response to unknown message";
       break;
     case MessageTypeTag::PutData:
       HandleMessage(Parse<PutData>(binary_input_stream), std::move(header));
